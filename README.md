@@ -2,6 +2,14 @@
 
 ConvertLink is a desktop app for downloading a video link as `MP3` or `MP4`.
 
+### Visual
+
+<details>
+  <summary>Current Design</summary>
+  
+  <img src="images/screenshots/1st snip.png">
+</details>
+
 ## Features
 
 - Paste a Youtube video link or short

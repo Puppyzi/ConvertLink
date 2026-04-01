@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.venv/
+build/
+dist/
+*.spec
+vendor/
+.pycache/
+.pyinstaller/

@@ -19,6 +19,13 @@ PhaseCallback = Optional[Callable[[str], None]]
 DOWNLOAD_PROGRESS_PREFIX = "__DL_PROGRESS__:"
 POSTPROCESS_PROGRESS_PREFIX = "__PP_PROGRESS__:"
 
+YOUTUBE_HOST_MARKERS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+TWITTER_HOST_MARKERS = ("twitter.com", "x.com")
+TWITTER_STATUS_PATTERN = re.compile(
+    r"https?://(?:www\.)?(?:twitter\.com|x\.com)/(?:[^/?#]+/)?(?:i/web/|i/)?status/(\d+)",
+    re.IGNORECASE,
+)
+
 
 class DependencyError(RuntimeError):
     pass
@@ -93,6 +100,23 @@ def dependency_report() -> dict[str, bool]:
     }
 
 
+def detect_source_platform(url: str) -> str:
+    lowered = url.lower()
+    if any(marker in lowered for marker in YOUTUBE_HOST_MARKERS):
+        return "youtube"
+    if any(marker in lowered for marker in TWITTER_HOST_MARKERS):
+        return "twitter"
+    return "generic"
+
+
+def normalize_media_url(url: str) -> str:
+    stripped = url.strip()
+    match = TWITTER_STATUS_PATTERN.search(stripped)
+    if match:
+        return f"https://x.com/i/status/{match.group(1)}"
+    return stripped
+
+
 def human_readable_size(size_bytes: Optional[int]) -> str:
     if size_bytes is None or size_bytes < 0:
         return "unknown"
@@ -125,6 +149,22 @@ def _as_int(value) -> Optional[int]:
     if numeric is None:
         return None
     return int(numeric)
+
+
+def _normalized_text(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _parse_resolution_text(value: str) -> tuple[Optional[int], Optional[int]]:
+    match = re.search(r"(\d{2,5})\s*[xX]\s*(\d{2,5})", value)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+
+    match = re.search(r"(\d{3,4})p\b", value.lower())
+    if match:
+        return None, int(match.group(1))
+
+    return None, None
 
 
 def _expected_extension(output_format: str) -> str:
@@ -205,29 +245,98 @@ def _estimated_size_bytes(format_info: dict, fallback_duration: Optional[float])
     return None
 
 
-def _is_progressive_mp4(format_info: dict) -> bool:
-    return (
-        format_info.get("ext") == "mp4"
-        and format_info.get("vcodec") not in (None, "none")
-        and format_info.get("acodec") not in (None, "none")
-        and _as_int(format_info.get("height")) is not None
-    )
-
-
-def _is_video_only_mp4(format_info: dict) -> bool:
-    return (
-        format_info.get("ext") == "mp4"
-        and format_info.get("vcodec") not in (None, "none")
-        and format_info.get("acodec") in (None, "none")
-        and _as_int(format_info.get("height")) is not None
-    )
-
-
 def _is_audio_only(format_info: dict) -> bool:
+    return not _format_has_video(format_info) and _format_has_audio(format_info)
+
+
+def _video_dimensions(format_info: dict) -> tuple[Optional[int], Optional[int]]:
+    width = _as_int(format_info.get("width"))
+    height = _as_int(format_info.get("height"))
+    if width or height:
+        return width, height
+
+    for field in ("resolution", "format_note", "format"):
+        value = str(format_info.get(field) or "")
+        if not value:
+            continue
+        parsed_width, parsed_height = _parse_resolution_text(value)
+        if parsed_width or parsed_height:
+            return parsed_width, parsed_height
+
+    return None, None
+
+
+def _format_has_video(format_info: dict) -> bool:
+    if any(_video_dimensions(format_info)):
+        return True
+
+    vcodec = _normalized_text(format_info.get("vcodec"))
+    if vcodec not in ("", "none", "unknown"):
+        return True
+
+    video_ext = _normalized_text(format_info.get("video_ext"))
+    if video_ext not in ("", "none"):
+        return True
+
+    resolution = _normalized_text(format_info.get("resolution"))
+    return bool(resolution and resolution != "audio only")
+
+
+def _format_has_audio(format_info: dict) -> bool:
+    acodec = _normalized_text(format_info.get("acodec"))
+    if acodec not in ("", "none", "unknown"):
+        return True
+
+    audio_ext = _normalized_text(format_info.get("audio_ext"))
+    if audio_ext not in ("", "none"):
+        return True
+
+    resolution = _normalized_text(format_info.get("resolution"))
+    if resolution == "audio only":
+        return True
+
+    format_note = _normalized_text(format_info.get("format_note"))
+    if format_note.startswith("audio"):
+        return True
+
+    return False
+
+
+def _format_audio_status(format_info: dict) -> str:
+    if _format_has_audio(format_info):
+        return "present"
+
+    acodec = _normalized_text(format_info.get("acodec"))
+    if acodec == "none":
+        return "missing"
+    if not acodec or acodec == "unknown":
+        return "unknown"
+    return "present"
+
+
+def _is_mp4_like_delivery(format_info: dict) -> bool:
+    ext = _normalized_text(format_info.get("ext"))
+    container = _normalized_text(format_info.get("container"))
+    protocol = _normalized_text(format_info.get("protocol"))
+    url = _normalized_text(format_info.get("url"))
+    manifest_url = _normalized_text(format_info.get("manifest_url"))
+
     return (
-        format_info.get("vcodec") in (None, "none")
-        and format_info.get("acodec") not in (None, "none")
+        ext == "mp4"
+        or "mp4" in container
+        or ".mp4" in url
+        or ".mp4" in manifest_url
+        or protocol.startswith("m3u8")
     )
+
+
+def _direct_delivery_note(format_info: dict) -> str:
+    protocol = _normalized_text(format_info.get("protocol"))
+    if protocol.startswith("m3u8"):
+        return "HLS stream saved as MP4"
+    if _normalized_text(format_info.get("ext")) == "mp4":
+        return "direct MP4 variant"
+    return "single video stream"
 
 
 def _preferred_audio_formats(formats: list[dict]) -> list[dict]:
@@ -251,6 +360,21 @@ def _select_best_audio_format(
         return None
 
     preferred = _preferred_audio_formats(audio_formats)
+    return max(preferred, key=lambda fmt: _audio_sort_key(fmt, duration_seconds))
+
+
+def _select_best_audio_source_format(
+    formats: list[dict], duration_seconds: Optional[float]
+) -> Optional[dict]:
+    audio_only = _select_best_audio_format(formats, duration_seconds)
+    if audio_only:
+        return audio_only
+
+    formats_with_audio = [fmt for fmt in formats if _format_has_audio(fmt)]
+    if not formats_with_audio:
+        return None
+
+    preferred = _preferred_audio_formats(formats_with_audio)
     return max(preferred, key=lambda fmt: _audio_sort_key(fmt, duration_seconds))
 
 
@@ -280,27 +404,29 @@ def _option_sort_key(option: VideoQualityOption) -> tuple:
 
 
 def _candidate_key(format_info: dict) -> tuple:
-    height = _as_int(format_info.get("height")) or 0
+    _width, height = _video_dimensions(format_info)
+    height = height or 0
     fps = _as_int(format_info.get("fps")) or 0
     fps_bucket = fps if fps >= 50 else 30 if fps else 0
     return (height, fps_bucket)
 
 
-def _build_progressive_option(
+def _build_direct_option(
     format_info: dict, duration_seconds: Optional[float]
 ) -> VideoQualityOption:
+    width, height = _video_dimensions(format_info)
     return VideoQualityOption(
         label=_quality_label(
-            _as_int(format_info.get("height")),
-            _as_int(format_info.get("width")),
+            height,
+            width,
             _as_float(format_info.get("fps")),
         ),
         selector=str(format_info.get("format_id")),
-        width=_as_int(format_info.get("width")),
-        height=_as_int(format_info.get("height")),
+        width=width,
+        height=height,
         fps=_as_float(format_info.get("fps")),
         estimated_size_bytes=_estimated_size_bytes(format_info, duration_seconds),
-        source_note="single MP4 stream",
+        source_note=_direct_delivery_note(format_info),
     )
 
 
@@ -309,6 +435,7 @@ def _build_merged_option(
     audio_format: dict,
     duration_seconds: Optional[float],
 ) -> VideoQualityOption:
+    width, height = _video_dimensions(video_format)
     video_size = _estimated_size_bytes(video_format, duration_seconds)
     audio_size = _estimated_size_bytes(audio_format, duration_seconds)
     combined_size = None
@@ -317,13 +444,13 @@ def _build_merged_option(
 
     return VideoQualityOption(
         label=_quality_label(
-            _as_int(video_format.get("height")),
-            _as_int(video_format.get("width")),
+            height,
+            width,
             _as_float(video_format.get("fps")),
         ),
         selector=f"{video_format.get('format_id')}+{audio_format.get('format_id')}",
-        width=_as_int(video_format.get("width")),
-        height=_as_int(video_format.get("height")),
+        width=width,
+        height=height,
         fps=_as_float(video_format.get("fps")),
         estimated_size_bytes=combined_size,
         source_note="video + audio merged into MP4",
@@ -406,14 +533,10 @@ def _friendly_postprocess_message(postprocessor: str, status: str) -> tuple[str,
     return label, log
 
 
-def inspect_media(url: str, progress_callback: ProgressCallback = None) -> MediaInspectionResult:
-    ffmpeg_path = ffmpeg_location()
+def _load_media_info(url: str, ffmpeg_path: Optional[str]) -> dict:
     command = _base_yt_dlp_command() + ["--dump-single-json", url]
     if ffmpeg_path:
         command.extend(["--ffmpeg-location", ffmpeg_path])
-
-    if progress_callback:
-        progress_callback("Inspecting available MP4 qualities...")
 
     result = subprocess.run(
         command,
@@ -437,6 +560,18 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
     if not isinstance(info, dict):
         raise RuntimeError("Unable to inspect this link.")
 
+    return info
+
+
+def inspect_media(url: str, progress_callback: ProgressCallback = None) -> MediaInspectionResult:
+    url = normalize_media_url(url)
+    ffmpeg_path = ffmpeg_location()
+    source_platform = detect_source_platform(url)
+
+    if progress_callback:
+        progress_callback("Inspecting available MP4 qualities...")
+    info = _load_media_info(url, ffmpeg_path)
+
     formats = info.get("formats") or []
     duration_seconds = _as_float(info.get("duration"))
     audio_format = _select_best_audio_format(formats, duration_seconds) if ffmpeg_path else None
@@ -445,9 +580,22 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
 
     for format_info in formats:
         candidate: Optional[VideoQualityOption] = None
-        if _is_progressive_mp4(format_info):
-            candidate = _build_progressive_option(format_info, duration_seconds)
-        elif audio_format and _is_video_only_mp4(format_info):
+        width, height = _video_dimensions(format_info)
+        if not (width or height):
+            continue
+        if not _format_has_video(format_info) or not _is_mp4_like_delivery(format_info):
+            continue
+
+        audio_status = _format_audio_status(format_info)
+        allow_unknown_audio = (
+            source_platform == "twitter"
+            or _normalized_text(format_info.get("protocol")).startswith("m3u8")
+        )
+        if audio_status == "present" or (
+            audio_status == "unknown" and allow_unknown_audio
+        ):
+            candidate = _build_direct_option(format_info, duration_seconds)
+        elif audio_format:
             candidate = _build_merged_option(format_info, audio_format, duration_seconds)
 
         if not candidate:
@@ -461,8 +609,9 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
     options = sorted(options_by_key.values(), key=_option_sort_key, reverse=True)
 
     if not options:
+        source_label = "X/Twitter" if source_platform == "twitter" else "this"
         raise RuntimeError(
-            "No MP4 quality options were found for this link. "
+            f"No MP4 quality options were found for {source_label} link. "
             "Try another link or install ffmpeg for broader format support."
         )
 
@@ -487,7 +636,9 @@ def download_media(
     mp4_selector: Optional[str] = None,
     mp4_label: Optional[str] = None,
 ) -> DownloadResult:
+    url = normalize_media_url(url)
     ffmpeg_path = ffmpeg_location()
+    source_platform = detect_source_platform(url)
 
     if output_format == "mp3" and not ffmpeg_path:
         raise DependencyError(
@@ -516,6 +667,23 @@ def download_media(
         command.extend(["--ffmpeg-location", ffmpeg_path])
 
     if output_format == "mp3":
+        audio_selector = None
+        if source_platform == "twitter":
+            if progress_callback:
+                progress_callback("Checking X/Twitter audio track...")
+            if phase_callback:
+                phase_callback("Preparing audio...")
+
+            info = _load_media_info(url, ffmpeg_path)
+            formats = info.get("formats") or []
+            duration_seconds = _as_float(info.get("duration"))
+            audio_source = _select_best_audio_source_format(formats, duration_seconds)
+            if not audio_source:
+                raise RuntimeError(
+                    "This X/Twitter post does not expose an audio track, so MP3 is not available for this link."
+                )
+            audio_selector = str(audio_source.get("format_id"))
+
         command.extend(
             [
                 "--extract-audio",
@@ -524,10 +692,12 @@ def download_media(
                 "--audio-quality",
                 "0",
                 "-f",
-                "bestaudio/best",
+                audio_selector or "ba/b",
             ]
         )
     elif output_format == "mp4":
+        if ffmpeg_path:
+            command.extend(["--remux-video", "mp4"])
         if mp4_selector:
             command.extend(["-f", mp4_selector])
             if "+" in mp4_selector:

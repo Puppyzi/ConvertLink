@@ -31,8 +31,10 @@ from converter_app.downloader import (
     download_media,
     human_readable_size,
     inspect_media,
+    normalize_media_url,
 )
 from converter_app.utils import downloads_directory, ensure_directory, notify, reveal_in_file_manager
+from converter_app.utils import open_media_file
 
 
 def _human_readable_duration(duration_seconds: Optional[int]) -> str:
@@ -46,6 +48,34 @@ def _human_readable_duration(duration_seconds: Optional[int]) -> str:
     if minutes:
         return f"{minutes}m {seconds}s"
     return f"{seconds}s"
+
+
+SOURCE_UI_COPY = {
+    "youtube": {
+        "display_name": "YouTube",
+        "body": "Paste a YouTube link, choose MP3 or MP4, and save it straight into Downloads.",
+        "link_label": "YouTube Link",
+        "placeholder": "Paste a YouTube video link",
+        "quality_label": "YouTube MP4 Quality",
+        "quality_combo_placeholder": "Check MP4 sizes to load available qualities",
+        "empty_summary": "Analyze this YouTube link to see which MP4 resolutions are actually available.",
+        "tip": "Tip: For MP4, click 'Check MP4 Sizes' to choose a quality and preview the file size before downloading.",
+        "mp4_prompt": "Choose MP4 mode, then click 'Check MP4 Sizes' to load qualities and estimated download size.",
+        "refresh_prompt": "Link updated. Click 'Check MP4 Sizes' to refresh available video qualities.",
+    },
+    "twitter": {
+        "display_name": "X/Twitter",
+        "body": "Paste an X/Twitter post link, choose MP3 or MP4, and save it straight into Downloads.",
+        "link_label": "X/Twitter Link",
+        "placeholder": "Paste an X/Twitter post link",
+        "quality_label": "X/Twitter MP4 Quality",
+        "quality_combo_placeholder": "Check MP4 sizes to load available X/Twitter variants",
+        "empty_summary": "Analyze this X/Twitter post to see which MP4 sizes are actually available.",
+        "tip": "Tip: For X/Twitter MP4, click 'Check MP4 Sizes' to load available sizes. MP3 works when the post includes audio.",
+        "mp4_prompt": "Choose MP4 mode, then click 'Check MP4 Sizes' to load X/Twitter sizes and estimated download size.",
+        "refresh_prompt": "Link updated. Click 'Check MP4 Sizes' to refresh available X/Twitter video sizes.",
+    },
+}
 
 
 class InspectWorker(QObject):
@@ -118,6 +148,7 @@ class ConverterWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.output_dir = ensure_directory(downloads_directory())
+        self.source_mode = "youtube"
         self.last_output_file: Optional[Path] = None
         self.worker_thread: Optional[QThread] = None
         self.worker: Optional[DownloadWorker] = None
@@ -129,15 +160,20 @@ class ConverterWindow(QMainWindow):
         self.analyzed_duration_seconds: Optional[int] = None
 
         self.setWindowTitle(APP_NAME)
-        self.resize(1000, 700)
+        self.resize(1050, 750)
         self.setMinimumSize(780, 560)
 
+        self.body_label: QLabel
+        self.youtube_source_button: QPushButton
+        self.twitter_source_button: QPushButton
+        self.link_label: QLabel
         self.url_input: QLineEdit
         self.mp3_radio: QRadioButton
         self.mp4_radio: QRadioButton
         self.convert_button: QPushButton
         self.analyze_button: QPushButton
         self.quality_combo: QComboBox
+        self.quality_section_label: QLabel
         self.media_summary_label: QLabel
         self.quality_estimate_label: QLabel
         self.quality_panel: QWidget
@@ -149,11 +185,13 @@ class ConverterWindow(QMainWindow):
 
         self._build_ui()
         self._bind_shortcuts()
+        self._reset_quality_state()
         self._refresh_dependency_status()
-        self._set_status("Ready. Finished files will be saved to Downloads.")
+        self._set_status(f"Ready. Converted files will be saved to {self.output_dir}.")
         self._update_format_ui()
 
     def _build_ui(self) -> None:
+        profile = self._source_profile()
         self.setStyleSheet(
             """
             QMainWindow {
@@ -227,6 +265,26 @@ class ConverterWindow(QMainWindow):
             QPushButton#primary:hover {
                 background: #245ed0;
             }
+            QPushButton#sourceButton {
+                background: #efe5d8;
+                border: 1px solid #e2d7c8;
+                border-radius: 14px;
+                max-width: 112px;
+                min-width: 0px;
+                padding: 8px 8px;
+            }
+            QPushButton#sourceButton:hover {
+                background: #e8dbc8;
+            }
+            QPushButton#sourceButton:checked {
+                background: #2f6fed;
+                border: 1px solid #2f6fed;
+                color: white;
+            }
+            QPushButton#sourceButton:checked:hover {
+                background: #245ed0;
+                border: 1px solid #245ed0;
+            }
             QProgressBar {
                 background: #ebdfd0;
                 border: none;
@@ -262,16 +320,43 @@ class ConverterWindow(QMainWindow):
         title.setObjectName("title")
         title.setAlignment(Qt.AlignHCenter)
 
-        body = QLabel(
-            "Paste a video link, choose MP3 or MP4, and save it straight into Downloads."
-        )
-        body.setObjectName("body")
-        body.setWordWrap(True)
-        body.setAlignment(Qt.AlignHCenter)
+        self.body_label = QLabel(profile["body"])
+        self.body_label.setObjectName("body")
+        self.body_label.setWordWrap(True)
+        self.body_label.setAlignment(Qt.AlignHCenter)
 
         header_layout.addWidget(title)
-        header_layout.addWidget(body)
+        header_layout.addWidget(self.body_label)
         root_layout.addLayout(header_layout)
+
+        source_row = QHBoxLayout()
+        source_row.setSpacing(12)
+        source_row.addStretch(1)
+
+        self.youtube_source_button = QPushButton("YouTube")
+        self.youtube_source_button.setObjectName("sourceButton")
+        self.youtube_source_button.setCheckable(True)
+        self.youtube_source_button.setChecked(True)
+        self.youtube_source_button.clicked.connect(
+            lambda _checked=False: self._set_source_mode("youtube")
+        )
+
+        self.twitter_source_button = QPushButton("X/Twitter")
+        self.twitter_source_button.setObjectName("sourceButton")
+        self.twitter_source_button.setCheckable(True)
+        self.twitter_source_button.clicked.connect(
+            lambda _checked=False: self._set_source_mode("twitter")
+        )
+
+        self.source_button_group = QButtonGroup(self)
+        self.source_button_group.setExclusive(True)
+        self.source_button_group.addButton(self.youtube_source_button)
+        self.source_button_group.addButton(self.twitter_source_button)
+
+        source_row.addWidget(self.youtube_source_button)
+        source_row.addWidget(self.twitter_source_button)
+        source_row.addStretch(1)
+        root_layout.addLayout(source_row)
 
         card = QFrame()
         card.setObjectName("card")
@@ -279,12 +364,12 @@ class ConverterWindow(QMainWindow):
         card_layout.setContentsMargins(22, 22, 22, 22)
         card_layout.setSpacing(16)
 
-        link_label = QLabel("Video Link")
-        link_label.setObjectName("section")
-        card_layout.addWidget(link_label)
+        self.link_label = QLabel(profile["link_label"])
+        self.link_label.setObjectName("section")
+        card_layout.addWidget(self.link_label)
 
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Paste a YouTube or other supported video link")
+        self.url_input.setPlaceholderText(profile["placeholder"])
         self.url_input.returnPressed.connect(self.start_download)
         self.url_input.textChanged.connect(self._handle_url_change)
         card_layout.addWidget(self.url_input)
@@ -316,9 +401,9 @@ class ConverterWindow(QMainWindow):
         quality_layout.setContentsMargins(0, 0, 0, 0)
         quality_layout.setSpacing(10)
 
-        quality_label = QLabel("MP4 Quality")
-        quality_label.setObjectName("section")
-        quality_layout.addWidget(quality_label)
+        self.quality_section_label = QLabel(profile["quality_label"])
+        self.quality_section_label.setObjectName("section")
+        quality_layout.addWidget(self.quality_section_label)
 
         analysis_row = QHBoxLayout()
         analysis_row.setSpacing(10)
@@ -328,7 +413,7 @@ class ConverterWindow(QMainWindow):
         analysis_row.addWidget(self.analyze_button)
 
         self.quality_combo = QComboBox()
-        self.quality_combo.setPlaceholderText("Check MP4 sizes to load available qualities")
+        self.quality_combo.setPlaceholderText(profile["quality_combo_placeholder"])
         self.quality_combo.currentIndexChanged.connect(self._update_quality_summary)
         analysis_row.addWidget(self.quality_combo, 1)
         quality_layout.addLayout(analysis_row)
@@ -404,6 +489,49 @@ class ConverterWindow(QMainWindow):
     def _current_url(self) -> str:
         return self.url_input.text().strip()
 
+    def _normalized_current_url(self) -> str:
+        current = self._current_url()
+        return normalize_media_url(current) if current else ""
+
+    def _source_profile(self) -> dict[str, str]:
+        return SOURCE_UI_COPY[self.source_mode]
+
+    def _source_display_name(self) -> str:
+        return self._source_profile()["display_name"]
+
+    def _apply_source_copy(self) -> None:
+        profile = self._source_profile()
+        self.body_label.setText(profile["body"])
+        self.link_label.setText(profile["link_label"])
+        self.url_input.setPlaceholderText(profile["placeholder"])
+        self.quality_section_label.setText(profile["quality_label"])
+        self.quality_combo.setPlaceholderText(profile["quality_combo_placeholder"])
+
+    def _set_source_mode(self, source_mode: str) -> None:
+        if source_mode not in SOURCE_UI_COPY or source_mode == self.source_mode:
+            return
+
+        self.source_mode = source_mode
+        self.youtube_source_button.setChecked(source_mode == "youtube")
+        self.twitter_source_button.setChecked(source_mode == "twitter")
+        self._apply_source_copy()
+        self._reset_quality_state()
+        self._refresh_dependency_status()
+        self._update_format_ui()
+
+        if self._current_url():
+            if self._selected_format() == "mp4":
+                self._set_status(self._source_profile()["refresh_prompt"])
+            else:
+                self._set_status(
+                    f"Ready. Converted files will be saved to {self.output_dir}."
+                )
+            return
+
+        self._set_status(
+            f"{self._source_display_name()} mode selected. Paste a link to get started."
+        )
+
     def _selected_format(self) -> str:
         return "mp3" if self.mp3_radio.isChecked() else "mp4"
 
@@ -417,7 +545,7 @@ class ConverterWindow(QMainWindow):
         return (
             self._selected_format() != "mp4"
             or (
-                self.analyzed_url == self._current_url()
+                self.analyzed_url == self._normalized_current_url()
                 and self._selected_quality_option() is not None
             )
         )
@@ -484,7 +612,7 @@ class ConverterWindow(QMainWindow):
             return
 
         self.dependency_label.setText(
-            "Tip: For MP4, click 'Check MP4 Sizes' to choose a quality and preview the file size before downloading."
+            self._source_profile()["tip"]
         )
 
     def _preferred_quality_index(self) -> int:
@@ -502,9 +630,7 @@ class ConverterWindow(QMainWindow):
         self.quality_combo.blockSignals(True)
         self.quality_combo.clear()
         self.quality_combo.blockSignals(False)
-        self.media_summary_label.setText(
-            "Analyze this link to see which MP4 resolutions are actually available."
-        )
+        self.media_summary_label.setText(self._source_profile()["empty_summary"])
         self.quality_estimate_label.setText(
             "Estimated MP4 size will appear here before download."
         )
@@ -515,9 +641,7 @@ class ConverterWindow(QMainWindow):
         self.quality_panel.setVisible(is_mp4)
         self._update_action_states()
         if is_mp4 and not self._has_current_quality_selection():
-            self._set_status(
-                "Choose MP4 mode, then click 'Check MP4 Sizes' to load qualities and estimated download size."
-            )
+            self._set_status(self._source_profile()["mp4_prompt"])
 
     def _update_action_states(self) -> None:
         busy = self._is_busy()
@@ -528,20 +652,34 @@ class ConverterWindow(QMainWindow):
         )
 
         self.url_input.setEnabled(not busy)
+        self.youtube_source_button.setEnabled(not busy)
+        self.twitter_source_button.setEnabled(not busy)
         self.mp3_radio.setEnabled(not busy)
         self.mp4_radio.setEnabled(not busy)
         self.convert_button.setEnabled(can_download)
         self.analyze_button.setEnabled(not busy and is_mp4 and url_present)
         self.quality_combo.setEnabled(not busy and is_mp4 and bool(self.quality_options))
 
+    def _refresh_last_file_button(self) -> None:
+        last_file = self.last_output_file
+        if not last_file:
+            self.show_last_file_button.setText("Show Last File")
+            self.show_last_file_button.setEnabled(False)
+            return
+
+        if last_file.suffix.lower() == ".mp3":
+            self.show_last_file_button.setText("Play Last File")
+        else:
+            self.show_last_file_button.setText("Show Last File")
+
+        self.show_last_file_button.setEnabled(last_file.exists())
+
     @Slot(str)
     def _handle_url_change(self, _text: str) -> None:
         self._reset_quality_state()
         self._update_format_ui()
         if self._selected_format() == "mp4" and self._current_url():
-            self._set_status(
-                "Link updated. Click 'Check MP4 Sizes' to refresh available video qualities."
-            )
+            self._set_status(self._source_profile()["refresh_prompt"])
         elif self._selected_format() == "mp3" and self._current_url():
             self._set_status(f"Ready. Converted files will be saved to {self.output_dir}.")
 
@@ -557,8 +695,12 @@ class ConverterWindow(QMainWindow):
 
         self._refresh_dependency_status()
         self._clear_log()
-        self._append_log("Inspecting MP4 qualities for this link...")
-        self._set_status("Fetching available MP4 qualities and estimated sizes...")
+        self._append_log(
+            f"Inspecting {self._source_display_name()} MP4 qualities for this link..."
+        )
+        self._set_status(
+            f"Fetching available {self._source_display_name()} MP4 qualities and estimated sizes..."
+        )
         self._show_indeterminate_progress("Checking MP4 sizes...")
 
         self.inspect_thread = QThread(self)
@@ -588,12 +730,12 @@ class ConverterWindow(QMainWindow):
             self._handle_inspection_error("Unexpected inspection result.")
             return
 
-        if result.source_url != self._current_url():
+        if result.source_url != self._normalized_current_url():
             self._set_status("Link changed while loading qualities. Please check MP4 sizes again.")
             return
 
         self.quality_options = result.mp4_options
-        self.analyzed_url = result.source_url
+        self.analyzed_url = normalize_media_url(result.source_url)
         self.analyzed_title = result.title
         self.analyzed_duration_seconds = result.duration_seconds
 
@@ -608,11 +750,13 @@ class ConverterWindow(QMainWindow):
         self._update_quality_summary()
 
         summary = (
-            f"Loaded {len(self.quality_options)} MP4 qualities for "
+            f"Loaded {len(self.quality_options)} {self._source_display_name()} MP4 qualities for "
             f"'{self.analyzed_title}' ({_human_readable_duration(self.analyzed_duration_seconds)})."
         )
         self.media_summary_label.setText(summary)
-        self._set_status("MP4 quality options are ready. Pick one and then download.")
+        self._set_status(
+            f"{self._source_display_name()} MP4 quality options are ready. Pick one and then download."
+        )
         self._reset_progress("Qualities loaded")
 
         for option in self.quality_options:
@@ -624,7 +768,9 @@ class ConverterWindow(QMainWindow):
     @Slot(str)
     def _handle_inspection_error(self, error_message: str) -> None:
         self._reset_quality_state()
-        self._set_status("Could not load MP4 quality options. Check the log for details.")
+        self._set_status(
+            f"Could not load {self._source_display_name()} MP4 quality options. Check the log for details."
+        )
         self._reset_progress("Inspection failed")
         self._append_log("")
         self._append_log("Inspection error:")
@@ -644,11 +790,11 @@ class ConverterWindow(QMainWindow):
 
         selected_option = None
         if self._selected_format() == "mp4":
-            if self.analyzed_url != url or not self._selected_quality_option():
+            if self.analyzed_url != self._normalized_current_url() or not self._selected_quality_option():
                 QMessageBox.information(
                     self,
                     APP_NAME,
-                    "Click 'Check MP4 Sizes' first so you can choose a resolution and see its estimated file size before downloading.",
+                    f"Click 'Check MP4 Sizes' first so you can choose a {self._source_display_name()} MP4 option and see its estimated file size before downloading.",
                 )
                 return
             selected_option = self._selected_quality_option()
@@ -736,7 +882,7 @@ class ConverterWindow(QMainWindow):
     def _handle_success(self, file_path_str: str) -> None:
         self._refresh_dependency_status()
         self.last_output_file = Path(file_path_str)
-        self.show_last_file_button.setEnabled(True)
+        self._refresh_last_file_button()
         self._set_status(f"Conversion Finished. Saved: {self.last_output_file}")
         self._show_progress_value(100, "Conversion Finished")
         notify(APP_NAME, f"Conversion Finished: {self.last_output_file.name}")
@@ -763,6 +909,9 @@ class ConverterWindow(QMainWindow):
     @Slot()
     def show_last_file(self) -> None:
         if self.last_output_file and self.last_output_file.exists():
+            if self.last_output_file.suffix.lower() == ".mp3":
+                open_media_file(self.last_output_file)
+                return
             reveal_in_file_manager(self.last_output_file)
 
     @Slot()

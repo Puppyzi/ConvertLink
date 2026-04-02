@@ -42,3 +42,27 @@ def reveal_in_file_manager(target: Path) -> None:
         return
 
     subprocess.run(["xdg-open", str(target.parent)], check=False)
+
+
+def open_media_file(target: Path) -> None:
+    system = platform.system()
+
+    if system == "Darwin":
+        if target.suffix.lower() == ".mp3":
+            result = subprocess.run(
+                ["open", "-a", "QuickTime Player", str(target)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return
+
+        subprocess.run(["open", str(target)], check=False)
+        return
+
+    if system == "Windows":
+        subprocess.run(["cmd", "/c", "start", "", str(target)], check=False)
+        return
+
+    subprocess.run(["xdg-open", str(target)], check=False)

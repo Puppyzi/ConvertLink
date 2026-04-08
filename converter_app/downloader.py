@@ -21,6 +21,9 @@ POSTPROCESS_PROGRESS_PREFIX = "__PP_PROGRESS__:"
 
 YOUTUBE_HOST_MARKERS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 TWITTER_HOST_MARKERS = ("twitter.com", "x.com")
+INSTAGRAM_HOST_MARKERS = ("instagram.com", "instagr.am")
+QUICKTIME_VIDEO_CODECS = {"h264", "hevc"}
+QUICKTIME_AUDIO_CODECS = {"aac", "alac", "mp3", "ac3", "eac3"}
 TWITTER_STATUS_PATTERN = re.compile(
     r"https?://(?:www\.)?(?:twitter\.com|x\.com)/(?:[^/?#]+/)?(?:i/web/|i/)?status/(\d+)",
     re.IGNORECASE,
@@ -106,6 +109,8 @@ def detect_source_platform(url: str) -> str:
         return "youtube"
     if any(marker in lowered for marker in TWITTER_HOST_MARKERS):
         return "twitter"
+    if any(marker in lowered for marker in INSTAGRAM_HOST_MARKERS):
+        return "instagram"
     return "generic"
 
 
@@ -133,6 +138,16 @@ def human_readable_size(size_bytes: Optional[int]) -> str:
         return f"{int(value)} {units[unit_index]}"
 
     return f"{value:.1f} {units[unit_index]}"
+
+
+def _source_display_name(source_platform: str) -> str:
+    if source_platform == "youtube":
+        return "YouTube"
+    if source_platform == "twitter":
+        return "X/Twitter"
+    if source_platform == "instagram":
+        return "Instagram"
+    return "this"
 
 
 def _as_float(value) -> Optional[float]:
@@ -533,6 +548,95 @@ def _friendly_postprocess_message(postprocessor: str, status: str) -> tuple[str,
     return label, log
 
 
+def _probe_primary_stream_codecs(
+    file_path: Path, ffmpeg_path: str
+) -> tuple[Optional[str], Optional[str]]:
+    result = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
+        capture_output=True,
+        text=True,
+    )
+    details = "\n".join(part for part in (result.stderr, result.stdout) if part)
+
+    video_match = re.search(r"Stream #.*?: Video: ([^,\s]+)", details)
+    audio_match = re.search(r"Stream #.*?: Audio: ([^,\s]+)", details)
+    video_codec = _normalized_text(video_match.group(1)) if video_match else None
+    audio_codec = _normalized_text(audio_match.group(1)) if audio_match else None
+    return video_codec, audio_codec
+
+
+def _quicktime_incompatibility_reason(
+    file_path: Path, ffmpeg_path: Optional[str]
+) -> Optional[str]:
+    if not ffmpeg_path:
+        return None
+
+    video_codec, audio_codec = _probe_primary_stream_codecs(file_path, ffmpeg_path)
+    if not video_codec:
+        return None
+
+    if video_codec not in QUICKTIME_VIDEO_CODECS:
+        return f"{video_codec.upper()} video"
+
+    if audio_codec and audio_codec not in QUICKTIME_AUDIO_CODECS:
+        return f"{audio_codec.upper()} audio"
+
+    return None
+
+
+def _transcode_mp4_for_quicktime(
+    source_path: Path,
+    ffmpeg_path: str,
+) -> Path:
+    transcoded_path = source_path.with_name(
+        f"{source_path.stem}.quicktime{source_path.suffix}"
+    )
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(source_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-map_metadata",
+        "0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(transcoded_path),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0 or not transcoded_path.exists():
+        details = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+        raise RuntimeError(
+            "The MP4 downloaded successfully, but converting it to a QuickTime-friendly "
+            f"H.264/AAC file failed.\n\n{details or 'ffmpeg exited with an unknown error.'}"
+        )
+
+    source_path.unlink(missing_ok=True)
+    transcoded_path.replace(source_path)
+    return source_path
+
+
 def _load_media_info(url: str, ffmpeg_path: Optional[str]) -> dict:
     command = _base_yt_dlp_command() + ["--dump-single-json", url]
     if ffmpeg_path:
@@ -587,10 +691,9 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
             continue
 
         audio_status = _format_audio_status(format_info)
-        allow_unknown_audio = (
-            source_platform == "twitter"
-            or _normalized_text(format_info.get("protocol")).startswith("m3u8")
-        )
+        allow_unknown_audio = source_platform in {"twitter", "instagram"} or _normalized_text(
+            format_info.get("protocol")
+        ).startswith("m3u8")
         if audio_status == "present" or (
             audio_status == "unknown" and allow_unknown_audio
         ):
@@ -609,7 +712,7 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
     options = sorted(options_by_key.values(), key=_option_sort_key, reverse=True)
 
     if not options:
-        source_label = "X/Twitter" if source_platform == "twitter" else "this"
+        source_label = _source_display_name(source_platform)
         raise RuntimeError(
             f"No MP4 quality options were found for {source_label} link. "
             "Try another link or install ffmpeg for broader format support."
@@ -796,6 +899,21 @@ def download_media(
             raise RuntimeError(
                 "The download finished, but the saved file could not be located."
             )
+
+        if output_format == "mp4" and ffmpeg_path:
+            incompatibility = _quicktime_incompatibility_reason(final_path, ffmpeg_path)
+            if incompatibility:
+                if phase_callback:
+                    phase_callback("Optimizing MP4...")
+                if progress_callback:
+                    progress_callback(
+                        "Downloaded MP4 uses "
+                        f"{incompatibility}, so it is being converted to H.264/AAC for "
+                        "better QuickTime compatibility..."
+                    )
+                final_path = _transcode_mp4_for_quicktime(final_path, ffmpeg_path)
+                if progress_callback:
+                    progress_callback("QuickTime-friendly MP4 conversion finished.")
 
         final_output_path = _move_to_destination(final_path, output_dir)
 

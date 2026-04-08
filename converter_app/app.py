@@ -75,6 +75,18 @@ SOURCE_UI_COPY = {
         "mp4_prompt": "Choose MP4 mode, then click 'Check MP4 Sizes' to load X/Twitter sizes and estimated download size.",
         "refresh_prompt": "Link updated. Click 'Check MP4 Sizes' to refresh available X/Twitter video sizes.",
     },
+    "instagram": {
+        "display_name": "Instagram",
+        "body": "Paste an Instagram reel or post link, choose MP3 or MP4, and save it straight into Downloads.",
+        "link_label": "Instagram Link",
+        "placeholder": "Paste an Instagram reel or post link",
+        "quality_label": "Instagram MP4 Quality",
+        "quality_combo_placeholder": "Check MP4 sizes to load available Instagram variants",
+        "empty_summary": "Analyze this Instagram link to see which MP4 sizes are actually available.",
+        "tip": "Tip: For Instagram MP4, click 'Check MP4 Sizes' to load available sizes. MP3 works when the reel or post exposes audio.",
+        "mp4_prompt": "Choose MP4 mode, then click 'Check MP4 Sizes' to load Instagram sizes and estimated download size.",
+        "refresh_prompt": "Link updated. Click 'Check MP4 Sizes' to refresh available Instagram video sizes.",
+    },
 }
 
 
@@ -166,6 +178,7 @@ class ConverterWindow(QMainWindow):
         self.body_label: QLabel
         self.youtube_source_button: QPushButton
         self.twitter_source_button: QPushButton
+        self.instagram_source_button: QPushButton
         self.link_label: QLabel
         self.url_input: QLineEdit
         self.mp3_radio: QRadioButton
@@ -348,13 +361,22 @@ class ConverterWindow(QMainWindow):
             lambda _checked=False: self._set_source_mode("twitter")
         )
 
+        self.instagram_source_button = QPushButton("Instagram")
+        self.instagram_source_button.setObjectName("sourceButton")
+        self.instagram_source_button.setCheckable(True)
+        self.instagram_source_button.clicked.connect(
+            lambda _checked=False: self._set_source_mode("instagram")
+        )
+
         self.source_button_group = QButtonGroup(self)
         self.source_button_group.setExclusive(True)
         self.source_button_group.addButton(self.youtube_source_button)
         self.source_button_group.addButton(self.twitter_source_button)
+        self.source_button_group.addButton(self.instagram_source_button)
 
         source_row.addWidget(self.youtube_source_button)
         source_row.addWidget(self.twitter_source_button)
+        source_row.addWidget(self.instagram_source_button)
         source_row.addStretch(1)
         root_layout.addLayout(source_row)
 
@@ -514,6 +536,7 @@ class ConverterWindow(QMainWindow):
         self.source_mode = source_mode
         self.youtube_source_button.setChecked(source_mode == "youtube")
         self.twitter_source_button.setChecked(source_mode == "twitter")
+        self.instagram_source_button.setChecked(source_mode == "instagram")
         self._apply_source_copy()
         self._reset_quality_state()
         self._refresh_dependency_status()
@@ -654,6 +677,7 @@ class ConverterWindow(QMainWindow):
         self.url_input.setEnabled(not busy)
         self.youtube_source_button.setEnabled(not busy)
         self.twitter_source_button.setEnabled(not busy)
+        self.instagram_source_button.setEnabled(not busy)
         self.mp3_radio.setEnabled(not busy)
         self.mp4_radio.setEnabled(not busy)
         self.convert_button.setEnabled(can_download)

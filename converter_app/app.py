@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from converter_app import APP_NAME
 from converter_app.downloader import (
+    AudioTrackOption,
     DependencyError,
     MediaInspectionResult,
     VideoQualityOption,
@@ -127,12 +128,14 @@ class DownloadWorker(QObject):
         output_format: str,
         output_dir: Path,
         mp4_option: Optional[VideoQualityOption] = None,
+        audio_track: Optional[AudioTrackOption] = None,
     ) -> None:
         super().__init__()
         self.url = url
         self.output_format = output_format
         self.output_dir = output_dir
         self.mp4_option = mp4_option
+        self.audio_track = audio_track
 
     @Slot()
     def run(self) -> None:
@@ -144,8 +147,8 @@ class DownloadWorker(QObject):
                 progress_callback=self.progress.emit,
                 progress_value_callback=self.progress_value.emit,
                 phase_callback=self.phase.emit,
-                mp4_selector=self.mp4_option.selector if self.mp4_option else None,
-                mp4_label=self.mp4_option.label if self.mp4_option else None,
+                mp4_option=self.mp4_option,
+                audio_track=self.audio_track,
             )
             self.success.emit(str(result.file_path))
         except DependencyError as exc:
@@ -167,6 +170,7 @@ class ConverterWindow(QMainWindow):
         self.inspect_thread: Optional[QThread] = None
         self.inspect_worker: Optional[InspectWorker] = None
         self.quality_options: list[VideoQualityOption] = []
+        self.audio_tracks: list[AudioTrackOption] = []
         self.analyzed_url = ""
         self.analyzed_title = ""
         self.analyzed_duration_seconds: Optional[int] = None
@@ -440,6 +444,20 @@ class ConverterWindow(QMainWindow):
         analysis_row.addWidget(self.quality_combo, 1)
         quality_layout.addLayout(analysis_row)
 
+        self.audio_track_row = QWidget()
+        audio_track_layout = QHBoxLayout(self.audio_track_row)
+        audio_track_layout.setContentsMargins(0, 0, 0, 0)
+        audio_track_layout.setSpacing(10)
+
+        audio_track_label = QLabel("Audio Track")
+        audio_track_label.setObjectName("section")
+        audio_track_layout.addWidget(audio_track_label)
+
+        self.audio_track_combo = QComboBox()
+        audio_track_layout.addWidget(self.audio_track_combo, 1)
+        quality_layout.addWidget(self.audio_track_row)
+        self.audio_track_row.hide()
+
         self.media_summary_label = QLabel()
         self.media_summary_label.setObjectName("body")
         self.media_summary_label.setWordWrap(True)
@@ -565,6 +583,12 @@ class ConverterWindow(QMainWindow):
         data = self.quality_combo.currentData()
         return data if isinstance(data, VideoQualityOption) else None
 
+    def _selected_audio_track(self) -> Optional[AudioTrackOption]:
+        if self.audio_track_combo.count() == 0:
+            return None
+        data = self.audio_track_combo.currentData()
+        return data if isinstance(data, AudioTrackOption) else None
+
     def _has_current_quality_selection(self) -> bool:
         return (
             self._selected_format() != "mp4"
@@ -651,12 +675,17 @@ class ConverterWindow(QMainWindow):
 
     def _reset_quality_state(self) -> None:
         self.quality_options = []
+        self.audio_tracks = []
         self.analyzed_url = ""
         self.analyzed_title = ""
         self.analyzed_duration_seconds = None
         self.quality_combo.blockSignals(True)
         self.quality_combo.clear()
         self.quality_combo.blockSignals(False)
+        self.audio_track_combo.blockSignals(True)
+        self.audio_track_combo.clear()
+        self.audio_track_combo.blockSignals(False)
+        self.audio_track_row.hide()
         self.media_summary_label.setText(self._source_profile()["empty_summary"])
         self.quality_estimate_label.setText(
             "Estimated MP4 size will appear here before download."
@@ -687,6 +716,7 @@ class ConverterWindow(QMainWindow):
         self.convert_button.setEnabled(can_download)
         self.analyze_button.setEnabled(not busy and is_mp4 and url_present)
         self.quality_combo.setEnabled(not busy and is_mp4 and bool(self.quality_options))
+        self.audio_track_combo.setEnabled(not busy and is_mp4 and bool(self.audio_tracks))
 
     def _refresh_last_file_button(self) -> None:
         last_file = self.last_output_file
@@ -763,6 +793,7 @@ class ConverterWindow(QMainWindow):
             return
 
         self.quality_options = result.mp4_options
+        self.audio_tracks = result.audio_tracks
         self.analyzed_url = normalize_media_url(result.source_url)
         self.analyzed_title = result.title
         self.analyzed_duration_seconds = result.duration_seconds
@@ -777,10 +808,27 @@ class ConverterWindow(QMainWindow):
         self.quality_combo.setCurrentIndex(default_index)
         self._update_quality_summary()
 
+        self.audio_track_combo.blockSignals(True)
+        self.audio_track_combo.clear()
+        for track in self.audio_tracks:
+            label = f"{track.label} — original" if track.is_original else track.label
+            self.audio_track_combo.addItem(label, track)
+        self.audio_track_combo.blockSignals(False)
+        if self.audio_tracks:
+            self.audio_track_combo.setCurrentIndex(0)
+            self.audio_track_row.show()
+        else:
+            self.audio_track_row.hide()
+
         summary = (
             f"Loaded {len(self.quality_options)} {self._source_display_name()} MP4 qualities for "
             f"'{self.analyzed_title}' ({_human_readable_duration(self.analyzed_duration_seconds)})."
         )
+        if self.audio_tracks:
+            summary += (
+                f" This video has {len(self.audio_tracks)} audio languages — the original track is "
+                "selected by default; pick another under 'Audio Track' if you want a different language."
+            )
         self.media_summary_label.setText(summary)
         self._set_status(
             f"{self._source_display_name()} MP4 quality options are ready. Pick one and then download."
@@ -817,6 +865,7 @@ class ConverterWindow(QMainWindow):
             return
 
         selected_option = None
+        selected_audio_track = None
         if self._selected_format() == "mp4":
             if self.analyzed_url != self._normalized_current_url() or not self._selected_quality_option():
                 QMessageBox.information(
@@ -826,6 +875,7 @@ class ConverterWindow(QMainWindow):
                 )
                 return
             selected_option = self._selected_quality_option()
+            selected_audio_track = self._selected_audio_track()
 
         self._refresh_dependency_status()
         self._clear_log()
@@ -837,6 +887,8 @@ class ConverterWindow(QMainWindow):
             self._append_log(
                 f"Chosen MP4 quality: {selected_option.label} | Estimated size: {size_text}"
             )
+        if selected_audio_track:
+            self._append_log(f"Chosen audio track: {selected_audio_track.label}")
 
         self.worker_thread = QThread(self)
         self.worker = DownloadWorker(
@@ -844,6 +896,7 @@ class ConverterWindow(QMainWindow):
             output_format=self._selected_format(),
             output_dir=self.output_dir,
             mp4_option=selected_option,
+            audio_track=selected_audio_track,
         )
         self.worker.moveToThread(self.worker_thread)
 

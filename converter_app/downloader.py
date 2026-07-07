@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -56,12 +56,21 @@ class VideoQualityOption:
     source_note: str
 
 
+@dataclass(frozen=True)
+class AudioTrackOption:
+    label: str
+    format_id: str
+    language: str
+    is_original: bool
+
+
 @dataclass
 class MediaInspectionResult:
     source_url: str
     title: str
     duration_seconds: Optional[int]
     mp4_options: list[VideoQualityOption]
+    audio_tracks: list[AudioTrackOption] = field(default_factory=list)
 
 
 def _runtime_root() -> Path:
@@ -365,11 +374,66 @@ def _preferred_audio_formats(formats: list[dict]) -> list[dict]:
     return preferred or formats
 
 
+def _is_original_audio(format_info: dict) -> bool:
+    note = _normalized_text(format_info.get("format_note"))
+    if "original" in note:
+        return True
+    if "dub" in note or "descriptive" in note:
+        return False
+    language_preference = _as_int(format_info.get("language_preference"))
+    return language_preference is not None and language_preference > 0
+
+
+def _is_drc_audio(format_info: dict) -> bool:
+    return "drc" in _normalized_text(format_info.get("format_id")) or "drc" in _normalized_text(
+        format_info.get("format_note")
+    )
+
+
 def _audio_sort_key(format_info: dict, duration_seconds: Optional[float]) -> tuple:
+    original_priority = 1 if _is_original_audio(format_info) else 0
+    plain_priority = 0 if _is_drc_audio(format_info) else 1
     ext_priority = 1 if format_info.get("ext") in {"m4a", "mp4", "aac"} else 0
     bitrate = _as_float(format_info.get("abr")) or _as_float(format_info.get("tbr")) or 0
     size = _estimated_size_bytes(format_info, duration_seconds) or 0
-    return (ext_priority, bitrate, size)
+    return (original_priority, plain_priority, ext_priority, bitrate, size)
+
+
+def _audio_track_label(format_info: dict, language: str) -> str:
+    note = str(format_info.get("format_note") or "").strip()
+    cleaned = re.sub(r"\b(?:low|medium|high)\b,?\s*", "", note, flags=re.IGNORECASE).strip(" ,")
+    if cleaned:
+        return cleaned
+    return language if language and language != "und" else "Unknown language"
+
+
+def _collect_audio_tracks(
+    formats: list[dict], duration_seconds: Optional[float]
+) -> list[AudioTrackOption]:
+    best_by_language: dict[str, dict] = {}
+    for format_info in formats:
+        if not _is_audio_only(format_info):
+            continue
+        language = str(format_info.get("language") or "").strip() or "und"
+        existing = best_by_language.get(language)
+        if not existing or _audio_sort_key(format_info, duration_seconds) > _audio_sort_key(
+            existing, duration_seconds
+        ):
+            best_by_language[language] = format_info
+
+    if len(best_by_language) < 2:
+        return []
+
+    tracks = [
+        AudioTrackOption(
+            label=_audio_track_label(format_info, language),
+            format_id=str(format_info.get("format_id")),
+            language=language,
+            is_original=_is_original_audio(format_info),
+        )
+        for language, format_info in best_by_language.items()
+    ]
+    return sorted(tracks, key=lambda track: (not track.is_original, track.label.lower()))
 
 
 def _select_best_audio_format(
@@ -475,6 +539,55 @@ def _build_merged_option(
         estimated_size_bytes=combined_size,
         source_note="video + audio merged into MP4",
     )
+
+
+def _audio_filter(audio_track: Optional[AudioTrackOption]) -> str:
+    if audio_track and audio_track.language and audio_track.language != "und":
+        primary_subtag = audio_track.language.split("-")[0]
+        return f"ba[language^={primary_subtag}]"
+    return "ba"
+
+
+def _compose_mp4_format_selector(
+    option: VideoQualityOption,
+    audio_track: Optional[AudioTrackOption],
+    ffmpeg_available: bool,
+) -> str:
+    # Format IDs recorded during inspection can disappear between requests
+    # (YouTube rotates them, notably on Shorts), so every exact-ID selector is
+    # followed by attribute-based fallbacks that keep the chosen resolution.
+    height = option.height
+    audio_filter = _audio_filter(audio_track)
+    parts: list[str] = []
+
+    if "+" in option.selector:
+        video_id, _, default_audio_id = option.selector.partition("+")
+        audio_id = audio_track.format_id if audio_track else default_audio_id
+        parts.append(f"{video_id}+{audio_id}")
+        parts.append(f"{video_id}+{audio_filter}[ext=m4a]")
+        parts.append(f"{video_id}+{audio_filter}")
+        if height:
+            parts.append(f"bv*[height={height}][ext=mp4]+{audio_filter}[ext=m4a]")
+            parts.append(f"bv*[height<={height}][ext=mp4]+{audio_filter}[ext=m4a]")
+            parts.append(f"bv*[height<={height}]+{audio_filter}")
+        parts.append("bv*[ext=mp4]+ba[ext=m4a]")
+        parts.append("b")
+        return "/".join(parts)
+
+    if ffmpeg_available and audio_track and not audio_track.is_original:
+        # A non-original track was chosen but this option is a single premuxed
+        # stream, so prefer building a merge that honors the requested track.
+        video_part = f"bv*[height={height}][ext=mp4]" if height else "bv*[ext=mp4]"
+        parts.append(f"{video_part}+{audio_track.format_id}")
+        parts.append(f"{video_part}+{audio_filter}[ext=m4a]")
+
+    parts.append(option.selector)
+    if height:
+        parts.append(f"b[height={height}][ext=mp4]")
+        if ffmpeg_available:
+            parts.append(f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]")
+    parts.append("b[ext=mp4]/b")
+    return "/".join(parts)
 
 
 def _base_yt_dlp_command() -> list[str]:
@@ -693,6 +806,7 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
     formats = info.get("formats") or []
     duration_seconds = _as_float(info.get("duration"))
     audio_format = _select_best_audio_format(formats, duration_seconds) if ffmpeg_path else None
+    audio_tracks = _collect_audio_tracks(formats, duration_seconds)
 
     options_by_key: dict[tuple, VideoQualityOption] = {}
 
@@ -734,12 +848,17 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
 
     if progress_callback:
         progress_callback(f"Found {len(options)} MP4 quality options.")
+        if audio_tracks:
+            progress_callback(
+                f"This video has {len(audio_tracks)} audio language tracks available."
+            )
 
     return MediaInspectionResult(
         source_url=url,
         title=str(info.get("title") or "Untitled video"),
         duration_seconds=_as_int(duration_seconds),
         mp4_options=options,
+        audio_tracks=audio_tracks,
     )
 
 
@@ -750,8 +869,8 @@ def download_media(
     progress_callback: ProgressCallback = None,
     progress_value_callback: ProgressValueCallback = None,
     phase_callback: PhaseCallback = None,
-    mp4_selector: Optional[str] = None,
-    mp4_label: Optional[str] = None,
+    mp4_option: Optional[VideoQualityOption] = None,
+    audio_track: Optional[AudioTrackOption] = None,
 ) -> DownloadResult:
     url = normalize_media_url(url)
     ffmpeg_path = ffmpeg_location()
@@ -763,7 +882,7 @@ def download_media(
             "'python3 -m pip install --target vendor -r requirements.txt'."
         )
 
-    if output_format == "mp4" and mp4_selector and "+" in mp4_selector and not ffmpeg_path:
+    if output_format == "mp4" and mp4_option and "+" in mp4_option.selector and not ffmpeg_path:
         raise DependencyError(
             "That MP4 quality needs ffmpeg to merge video and audio. Install it with "
             "'python3 -m pip install --target vendor -r requirements.txt'."
@@ -785,7 +904,9 @@ def download_media(
 
     if output_format == "mp3":
         audio_selector = None
-        if source_platform == "twitter":
+        if audio_track:
+            audio_selector = f"{audio_track.format_id}/{_audio_filter(audio_track)}/ba"
+        elif source_platform == "twitter":
             if progress_callback:
                 progress_callback("Checking X/Twitter audio track...")
             if phase_callback:
@@ -815,9 +936,12 @@ def download_media(
     elif output_format == "mp4":
         if ffmpeg_path:
             command.extend(["--remux-video", "mp4"])
-        if mp4_selector:
-            command.extend(["-f", mp4_selector])
-            if "+" in mp4_selector:
+        if mp4_option:
+            selector = _compose_mp4_format_selector(
+                mp4_option, audio_track, ffmpeg_path is not None
+            )
+            command.extend(["-f", selector])
+            if ffmpeg_path:
                 command.extend(["--merge-output-format", "mp4"])
         elif ffmpeg_path:
             command.extend(

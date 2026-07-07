@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -92,11 +93,26 @@ def deno_location() -> Optional[str]:
     return _bundled_tool("tools", "deno") or shutil.which("deno")
 
 
-def ffmpeg_location() -> Optional[str]:
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path:
-        return ffmpeg_path
+def _validated_executable(path: Optional[str]) -> Optional[str]:
+    # `shutil.which` only checks that a file exists; on Windows a Microsoft
+    # Store "app execution alias" or a stale package-manager shim passes that
+    # check but fails to launch with WinError 2. Only trust paths that run.
+    if not path:
+        return None
+    try:
+        subprocess.run(
+            [path, "-version"],
+            capture_output=True,
+            timeout=15,
+            creationflags=SUBPROCESS_FLAGS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return path
 
+
+@functools.lru_cache(maxsize=1)
+def ffmpeg_location() -> Optional[str]:
     vendor_dir = _runtime_root() / "vendor"
     if vendor_dir.exists() and str(vendor_dir) not in sys.path:
         sys.path.insert(0, str(vendor_dir))
@@ -104,9 +120,13 @@ def ffmpeg_location() -> Optional[str]:
     try:
         from imageio_ffmpeg import get_ffmpeg_exe
 
-        return get_ffmpeg_exe()
+        # imageio-ffmpeg launch-tests every candidate except the
+        # IMAGEIO_FFMPEG_EXE override, so validate before trusting it.
+        return _validated_executable(get_ffmpeg_exe())
     except Exception:
-        return None
+        pass
+
+    return _validated_executable(shutil.which("ffmpeg"))
 
 
 def dependency_report() -> dict[str, bool]:
@@ -620,6 +640,16 @@ def _base_yt_dlp_command() -> list[str]:
     return command
 
 
+def _tool_launch_error(tool_path: str, exc: OSError) -> str:
+    return (
+        f"Could not launch the downloader tool at:\n{tool_path}\n\n"
+        f"({exc})\n\n"
+        "The file may have been removed or blocked by antivirus software. "
+        "Re-extract the app from its zip, and if it happens again add an "
+        "antivirus exclusion for the app folder."
+    )
+
+
 def _augment_error_message(message: str) -> str:
     lowered = message.lower()
     if "403" in lowered and "youtube" in lowered:
@@ -669,14 +699,19 @@ def _friendly_postprocess_message(postprocessor: str, status: str) -> tuple[str,
 def _probe_primary_stream_codecs(
     file_path: Path, ffmpeg_path: str
 ) -> tuple[Optional[str], Optional[str]]:
-    result = subprocess.run(
-        [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=SUBPROCESS_FLAGS,
-    )
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=SUBPROCESS_FLAGS,
+        )
+    except OSError:
+        # The download already succeeded; a broken ffmpeg should only skip
+        # the compatibility check, never fail the whole conversion.
+        return None, None
     details = "\n".join(part for part in (result.stderr, result.stdout) if part)
 
     video_match = re.search(r"Stream #.*?: Video: ([^,\s]+)", details)
@@ -740,14 +775,20 @@ def _transcode_mp4_for_quicktime(
         "+faststart",
         str(transcoded_path),
     ]
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=SUBPROCESS_FLAGS,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=SUBPROCESS_FLAGS,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "The MP4 downloaded successfully, but ffmpeg could not be launched "
+            f"to convert it for wider player compatibility ({exc})."
+        ) from exc
 
     if result.returncode != 0 or not transcoded_path.exists():
         details = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
@@ -766,14 +807,17 @@ def _load_media_info(url: str, ffmpeg_path: Optional[str]) -> dict:
     if ffmpeg_path:
         command.extend(["--ffmpeg-location", ffmpeg_path])
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=SUBPROCESS_FLAGS,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=SUBPROCESS_FLAGS,
+        )
+    except OSError as exc:
+        raise DependencyError(_tool_launch_error(command[0], exc)) from exc
 
     if result.returncode != 0:
         message = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
@@ -960,16 +1004,19 @@ def download_media(
     command.append(url)
 
     try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=SUBPROCESS_FLAGS,
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=SUBPROCESS_FLAGS,
+            )
+        except OSError as exc:
+            raise DependencyError(_tool_launch_error(command[0], exc)) from exc
 
         if process.stdout is None:
             raise RuntimeError("Failed to capture downloader output.")

@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --target vendor -r requirements.txt
+          python3 -m pip install --target vendor pyinstaller
+      - name: Download bundled tools
+        run: python3 setup_tools.py
+      - name: Build app
+        run: ./build_mac_app.sh
+      - name: Zip app
+        run: ditto -c -k --keepParent "dist/ConvertLink.app" ConvertLink-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConvertLink-macOS
+          path: ConvertLink-macOS.zip
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --target vendor -r requirements.txt
+          python -m pip install --target vendor pyinstaller
+      - name: Download bundled tools
+        run: python setup_tools.py
+      - name: Build app
+        run: ./build_windows_app.ps1
+      - name: Zip app
+        run: Compress-Archive -Path dist/ConvertLink -DestinationPath ConvertLink-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConvertLink-Windows
+          path: ConvertLink-Windows.zip
+
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ConvertLink-macOS.zip
+            ConvertLink-Windows.zip

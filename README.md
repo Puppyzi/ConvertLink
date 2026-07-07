@@ -2,6 +2,13 @@
 
 ConvertLink is a desktop app for downloading a video link as `MP3` or `MP4`.
 
+## Download
+
+Grab the latest build for your OS from the [Releases page](https://github.com/Puppyzi/ConvertLink/releases/latest):
+
+- **macOS**: `ConvertLink-macOS.zip` — unzip and open `ConvertLink.app` (right-click → Open the first time, since the app is unsigned)
+- **Windows**: `ConvertLink-Windows.zip` — unzip and run `ConvertLink.exe` (if SmartScreen appears, click "More info" → "Run anyway")
+
 ### Visual
 
 <details>

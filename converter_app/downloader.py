@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+IS_WINDOWS = sys.platform == "win32"
+# Keep helper-tool consoles from flashing over the windowed app.
+SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+EXECUTABLE_SUFFIX = ".exe" if IS_WINDOWS else ""
+
 
 ProgressCallback = Optional[Callable[[str], None]]
 ProgressValueCallback = Optional[Callable[[int], None]]
@@ -66,7 +71,7 @@ def _runtime_root() -> Path:
 
 
 def _bundled_tool(*parts: str) -> Optional[str]:
-    candidate = _runtime_root().joinpath(*parts)
+    candidate = _runtime_root().joinpath(*parts[:-1], parts[-1] + EXECUTABLE_SUFFIX)
     return str(candidate) if candidate.exists() else None
 
 
@@ -555,6 +560,9 @@ def _probe_primary_stream_codecs(
         [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=SUBPROCESS_FLAGS,
     )
     details = "\n".join(part for part in (result.stderr, result.stdout) if part)
 
@@ -623,12 +631,15 @@ def _transcode_mp4_for_quicktime(
         command,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=SUBPROCESS_FLAGS,
     )
 
     if result.returncode != 0 or not transcoded_path.exists():
         details = "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
         raise RuntimeError(
-            "The MP4 downloaded successfully, but converting it to a QuickTime-friendly "
+            "The MP4 downloaded successfully, but converting it to a widely playable "
             f"H.264/AAC file failed.\n\n{details or 'ffmpeg exited with an unknown error.'}"
         )
 
@@ -646,6 +657,9 @@ def _load_media_info(url: str, ffmpeg_path: Optional[str]) -> dict:
         command,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=SUBPROCESS_FLAGS,
     )
 
     if result.returncode != 0:
@@ -827,7 +841,10 @@ def download_media(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
+            creationflags=SUBPROCESS_FLAGS,
         )
 
         if process.stdout is None:
@@ -909,11 +926,11 @@ def download_media(
                     progress_callback(
                         "Downloaded MP4 uses "
                         f"{incompatibility}, so it is being converted to H.264/AAC for "
-                        "better QuickTime compatibility..."
+                        "better media player compatibility..."
                     )
                 final_path = _transcode_mp4_for_quicktime(final_path, ffmpeg_path)
                 if progress_callback:
-                    progress_callback("QuickTime-friendly MP4 conversion finished.")
+                    progress_callback("Player-friendly MP4 conversion finished.")
 
         final_output_path = _move_to_destination(final_path, output_dir)
 

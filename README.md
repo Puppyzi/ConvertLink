@@ -16,19 +16,39 @@ ConvertLink is a desktop app for downloading a video link as `MP3` or `MP4`.
 - Download as `MP3` or `MP4`
 - Preview MP4 quality options and estimated file size
 - Save finished files to `Downloads`
-- Show progress and a macOS completion notification
+- Show progress and a desktop completion notification
+- Works on macOS and Windows
 
 ## Run
 
+macOS:
+
 ```bash
 python3 -m pip install --target vendor -r requirements.txt
-./setup_tools.sh
+python3 setup_tools.py
 python3 main.py
+```
+
+Windows:
+
+```powershell
+python -m pip install --target vendor -r requirements.txt
+python setup_tools.py
+python main.py
 ```
 
 ## Build
 
+macOS:
+
 ```bash
 python3 -m pip install --target vendor pyinstaller
 ./build_mac_app.sh
+```
+
+Windows:
+
+```powershell
+python -m pip install --target vendor pyinstaller
+./build_windows_app.ps1
 ```

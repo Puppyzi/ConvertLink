@@ -9,3 +9,5 @@ dist/
 vendor/
 .pycache/
 .pyinstaller/
+tools/
+.yt-dlp-cache/

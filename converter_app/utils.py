@@ -1,6 +1,23 @@
 import platform
 import subprocess
 from pathlib import Path
+from xml.sax.saxutils import escape
+
+SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+)
+
+_WINDOWS_TOAST_TEMPLATE = """
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml(@'
+<toast><visual><binding template="ToastGeneric"><text>{title}</text><text>{message}</text></binding></visual></toast>
+'@)
+$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+$appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
+"""
 
 
 def downloads_directory() -> Path:
@@ -27,6 +44,20 @@ def notify(title: str, message: str) -> None:
             check=False,
             capture_output=True,
             text=True,
+        )
+        return
+
+    if system == "Windows":
+        script = _WINDOWS_TOAST_TEMPLATE.format(
+            title=escape(title),
+            message=escape(message),
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=SUBPROCESS_FLAGS,
         )
 
 

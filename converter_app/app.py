@@ -498,7 +498,8 @@ class ConverterWindow(QMainWindow):
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setFont(QFont("Menlo", 11))
+        log_font_family = "Consolas" if sys.platform == "win32" else "Menlo"
+        self.log_box.setFont(QFont(log_font_family, 11))
         root_layout.addWidget(self.log_box, 1)
 
         self.setCentralWidget(container)
@@ -629,8 +630,11 @@ class ConverterWindow(QMainWindow):
                 missing_text = ", ".join(missing_tools[:-1]) + f", and {missing_tools[-1]}"
                 verb = "are"
 
+            setup_command = (
+                "python setup_tools.py" if sys.platform == "win32" else "./setup_tools.sh"
+            )
             self.dependency_label.setText(
-                f"Setup needed: {missing_text} {verb} missing. Run './setup_tools.sh' to restore the bundled tools."
+                f"Setup needed: {missing_text} {verb} missing. Run '{setup_command}' to restore the bundled tools."
             )
             return
 

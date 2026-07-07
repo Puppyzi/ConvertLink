@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -640,6 +641,15 @@ def _base_yt_dlp_command() -> list[str]:
     return command
 
 
+def _tool_environment() -> dict[str, str]:
+    # yt-dlp writes piped output in the Windows ANSI code page by default,
+    # which corrupts emoji/curly quotes in titles; the printed file path then
+    # no longer matches the file on disk. Force UTF-8 to match our readers.
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def _tool_launch_error(tool_path: str, exc: OSError) -> str:
     return (
         f"Could not launch the downloader tool at:\n{tool_path}\n\n"
@@ -652,13 +662,21 @@ def _tool_launch_error(tool_path: str, exc: OSError) -> str:
 
 def _augment_error_message(message: str) -> str:
     lowered = message.lower()
-    if "403" in lowered and "youtube" in lowered:
+    if "403" in lowered:
         return (
             message
-            + "\n\nYouTube blocked the request. This app now uses the newer yt-dlp + Deno path, "
-            "but some videos may still require browser cookies or YouTube may be rate-limiting the IP."
+            + "\n\nThe site temporarily refused the download (HTTP 403). This usually happens "
+            "after several rapid downloads and clears on its own — wait a minute or two and try again."
         )
     return message
+
+
+def _is_http_403_error(exc: Exception) -> bool:
+    return "403" in str(exc) and not isinstance(exc, DependencyError)
+
+
+def _clear_yt_dlp_cache() -> None:
+    shutil.rmtree(_runtime_root() / ".yt-dlp-cache", ignore_errors=True)
 
 
 def _extract_progress_value(line: str) -> Optional[int]:
@@ -815,6 +833,7 @@ def _load_media_info(url: str, ffmpeg_path: Optional[str]) -> dict:
             encoding="utf-8",
             errors="replace",
             creationflags=SUBPROCESS_FLAGS,
+            env=_tool_environment(),
         )
     except OSError as exc:
         raise DependencyError(_tool_launch_error(command[0], exc)) from exc
@@ -907,6 +926,52 @@ def inspect_media(url: str, progress_callback: ProgressCallback = None) -> Media
 
 
 def download_media(
+    url: str,
+    output_format: str,
+    output_dir: Path,
+    progress_callback: ProgressCallback = None,
+    progress_value_callback: ProgressValueCallback = None,
+    phase_callback: PhaseCallback = None,
+    mp4_option: Optional[VideoQualityOption] = None,
+    audio_track: Optional[AudioTrackOption] = None,
+) -> DownloadResult:
+    try:
+        return _download_media_once(
+            url,
+            output_format,
+            output_dir,
+            progress_callback,
+            progress_value_callback,
+            phase_callback,
+            mp4_option,
+            audio_track,
+        )
+    except RuntimeError as exc:
+        if not _is_http_403_error(exc):
+            raise
+        # A 403 is usually a stale signature cache or expired stream URLs;
+        # one fresh attempt with a clean cache resolves most of them.
+        _clear_yt_dlp_cache()
+        if phase_callback:
+            phase_callback("Retrying...")
+        if progress_callback:
+            progress_callback(
+                "The site refused the stream (HTTP 403). Retrying once with a fresh session..."
+            )
+        time.sleep(2)
+        return _download_media_once(
+            url,
+            output_format,
+            output_dir,
+            progress_callback,
+            progress_value_callback,
+            phase_callback,
+            mp4_option,
+            audio_track,
+        )
+
+
+def _download_media_once(
     url: str,
     output_format: str,
     output_dir: Path,
@@ -1014,6 +1079,7 @@ def download_media(
                 errors="replace",
                 bufsize=1,
                 creationflags=SUBPROCESS_FLAGS,
+                env=_tool_environment(),
             )
         except OSError as exc:
             raise DependencyError(_tool_launch_error(command[0], exc)) from exc
@@ -1075,12 +1141,15 @@ def download_media(
                 )
             )
 
-        if not final_path:
+        # The reported path can be wrong even when present (e.g. an encoding
+        # mismatch mangled special characters), so verify it and fall back to
+        # scanning the private staging directory for the freshly written file.
+        if not final_path or not final_path.exists():
             final_path = _find_recent_output(
                 output_dir=staging_dir,
                 extension=_expected_extension(output_format),
                 started_at=started_at,
-                candidate=None,
+                candidate=final_path,
             )
 
         if not final_path:

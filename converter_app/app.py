@@ -259,6 +259,33 @@ class ConverterWindow(QMainWindow):
                 font-size: 14px;
                 spacing: 8px;
             }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 10px;
+                border: 2px solid #d9ccb8;
+                background: white;
+            }
+            QRadioButton::indicator:hover {
+                border: 2px solid #b8a88e;
+            }
+            QRadioButton::indicator:checked {
+                width: 8px;
+                height: 8px;
+                border: 6px solid #2f6fed;
+                border-radius: 10px;
+                background: white;
+            }
+            QRadioButton::indicator:checked:hover {
+                border: 6px solid #245ed0;
+            }
+            QRadioButton::indicator:disabled {
+                border: 2px solid #ddd6cb;
+                background: #f0ece4;
+            }
+            QRadioButton::indicator:checked:disabled {
+                border: 6px solid #a9bede;
+            }
             QPushButton {
                 background: #efe5d8;
                 border: none;
